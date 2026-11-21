@@ -82,6 +82,58 @@ class WriteBlockRequest(BaseModel):
     )
 
 
+class CreateRecoveryRequest(BaseModel):
+    name: str = Field(
+        examples=["restore-dr-1"],
+        description=(
+            "Unique recovery session name (letters, digits, '.', '_', '-')."
+        ),
+    )
+    volume_name: str = Field(
+        examples=["restored-volume"],
+        description="Name the writable volume will get once the recovery commits.",
+    )
+    block_size: int = Field(
+        examples=[8],
+        gt=0,
+        description="Fixed block size in bytes (1..1048576).",
+    )
+    block_count: int | None = Field(
+        default=None,
+        description=(
+            "Optional number of blocks; when supplied it must equal the number "
+            "of entries in `manifest`."
+        ),
+        examples=[2],
+    )
+    manifest: list[str] = Field(
+        description=(
+            "SHA-256 of every block, ordered by block index (64 lowercase hex "
+            "characters each). Blocks whose bytes are already stored need no upload."
+        ),
+        examples=[
+            [
+                "490ee80fa30fbd2ad047f50e41b7f1a51b6a421d3ea59d7479f271addb7e2ff2",
+                "bf9cc6a32d0e5b1b2a8d0f4d338d96e4f9d4d97c0d65e72b1d0d2d46a3d48a18",
+            ]
+        ],
+    )
+
+
+class UploadRecoveryBlockRequest(BaseModel):
+    sha256: str = Field(
+        description=(
+            "Manifest digest of this block (64 lowercase hex characters); must "
+            "match the recovery's manifest entry for the block index."
+        ),
+        examples=["490ee80fa30fbd2ad047f50e41b7f1a51b6a421d3ea59d7479f271addb7e2ff2"],
+    )
+    data_base64: str = Field(
+        description="Block payload, base64-encoded; decoded length must equal block_size.",
+        examples=["UkVDT1ZFUjE="],
+    )
+
+
 # ---------------------------------------------------------------------------
 # dependency
 # ---------------------------------------------------------------------------
@@ -122,7 +174,12 @@ def create_app(db_path: str | None = None, *, busy_timeout: float | None = None)
             "6. `POST /bases/{base_id}/retirement/prepare` then "
             "`POST /bases/{base_id}/retirement/commit` – remove the base. "
             "Volumes stay writable and every acknowledged write is preserved; "
-            "unreferenced blocks are reclaimed for reuse.\n\n"
+            "unreferenced blocks are reclaimed for reuse.\n"
+            "7. `POST /recoveries` – restore a writable volume from a remote "
+            "backup: hand over the ordered SHA-256 manifest, upload only the "
+            "missing blocks (`PUT /recoveries/{id}/blocks/{i}`), then "
+            "`POST /recoveries/{id}/commit` to publish the volume atomically. "
+            "Repeating a finished commit returns the same volume id.\n\n"
             "Volumes that inherit the same base block share one stored copy "
             "(content-addressed payloads); references are counted per payload."
         ),
@@ -132,6 +189,14 @@ def create_app(db_path: str | None = None, *, busy_timeout: float | None = None)
             {
                 "name": "volumes",
                 "description": "Create writable volumes and read/write/zero blocks.",
+            },
+            {
+                "name": "recoveries",
+                "description": (
+                    "Restore a writable volume from a remote-backup SHA-256 "
+                    "manifest: only missing blocks are transferred, and the "
+                    "volume is published atomically once every block is present."
+                ),
             },
             {
                 "name": "operations",
@@ -144,10 +209,9 @@ def create_app(db_path: str | None = None, *, busy_timeout: float | None = None)
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.detail, "code": exc.code},
-        )
+        content = {"detail": exc.detail, "code": exc.code}
+        content.update(exc.extra)
+        return JSONResponse(status_code=exc.status_code, content=content)
 
     @app.get("/healthz", tags=["operations"], summary="Liveness probe")
     def healthz() -> dict:
@@ -333,6 +397,108 @@ def create_app(db_path: str | None = None, *, busy_timeout: float | None = None)
     @app.delete("/volumes/{volume_id}", tags=["volumes"], summary="Delete a volume")
     def delete_volume(svc: Service, volume_id: str) -> dict:
         return svc.delete_volume(volume_id)
+
+    # ------------------------------------------------------------ recoveries
+    @app.post(
+        "/recoveries",
+        status_code=201,
+        tags=["recoveries"],
+        summary="Open a recovery from a remote-backup block manifest",
+    )
+    def create_recovery(payload: CreateRecoveryRequest, svc: Service) -> dict:
+        """Register a not-yet-published writable volume to restore.
+
+        The manifest lists the SHA-256 of every block in block-index order.
+        Blocks whose bytes are already held by the store (same size and digest)
+        are linked immediately; the response lists the distinct digests of the
+        blocks still missing, each one only once. Reclamation (volume deletion,
+        base retirement) keeps working while the recovery is open.
+        """
+        if payload.block_count is not None and payload.block_count != len(
+            payload.manifest
+        ):
+            raise ServiceError(
+                422,
+                f"block_count ({payload.block_count}) does not match the number "
+                f"of manifest entries ({len(payload.manifest)})",
+                "manifest_length_mismatch",
+            )
+        return svc.create_recovery(
+            payload.name,
+            payload.volume_name,
+            payload.block_size,
+            payload.manifest,
+        )
+
+    @app.get("/recoveries", tags=["recoveries"], summary="List recovery sessions")
+    def list_recoveries(svc: Service) -> list[dict]:
+        return svc.list_recoveries()
+
+    @app.get(
+        "/recoveries/{recovery_id}",
+        tags=["recoveries"],
+        summary="Get one recovery, including the latest missing-block list",
+    )
+    def get_recovery(svc: Service, recovery_id: str) -> dict:
+        return svc.get_recovery(recovery_id)
+
+    @app.put(
+        "/recoveries/{recovery_id}/blocks/{block_index}",
+        tags=["recoveries"],
+        summary="Supply one missing block (JSON, base64 payload)",
+    )
+    def upload_recovery_block(
+        svc: Service,
+        recovery_id: str,
+        payload: UploadRecoveryBlockRequest,
+        block_index: int = Path(ge=0),
+    ) -> dict:
+        return svc.upload_recovery_block(
+            recovery_id,
+            block_index,
+            payload.sha256,
+            _decode_b64(payload.data_base64),
+        )
+
+    @app.put(
+        "/recoveries/{recovery_id}/blocks/{block_index}/raw",
+        tags=["recoveries"],
+        summary="Supply one missing block (raw octet-stream body)",
+    )
+    def upload_recovery_block_raw(
+        svc: Service,
+        recovery_id: str,
+        sha256: str = Query(
+            description="Manifest digest of this block (64 lowercase hex characters).",
+            pattern="^[0-9a-f]{64}$",
+        ),
+        body: bytes = Body(media_type="application/octet-stream"),
+        block_index: int = Path(ge=0),
+    ) -> dict:
+        return svc.upload_recovery_block(recovery_id, block_index, sha256, body)
+
+    @app.post(
+        "/recoveries/{recovery_id}/commit",
+        tags=["recoveries"],
+        summary="Publish the volume once every block is present",
+    )
+    def commit_recovery(svc: Service, recovery_id: str) -> dict:
+        """Atomically create the writable volume when all blocks are available.
+
+        If blocks are still missing, returns **409** with the refreshed
+        distinct missing-digest list and keeps every block already received.
+        Repeating the commit of a finished recovery returns the original volume
+        id instead of creating a second volume.
+        """
+        return svc.commit_recovery(recovery_id)
+
+    @app.delete(
+        "/recoveries/{recovery_id}",
+        tags=["recoveries"],
+        summary="Abandon a recovery and release the blocks it was holding",
+    )
+    def delete_recovery(svc: Service, recovery_id: str) -> dict:
+        return svc.delete_recovery(recovery_id)
 
     # ---------------------------------------------------------- operations
     @app.get("/stats", tags=["operations"], summary="Storage statistics")

@@ -17,6 +17,18 @@ images, exposed as a FastAPI service and persisted in a single SQLite database.
   inherited content and every acknowledged write is preserved. Base blocks no
   volume inherits any more are released and recycled into a free-slot pool that
   later writes reuse.
+* **Recovery** restores a writable volume from a remote backup without
+  re-transferring blocks the store already holds. A recovery session takes the
+  new volume name, the block size and the SHA-256 digest of every block in
+  index order; it answers with the distinct digests of the blocks still
+  missing (each listed once). Uploaded blocks are checked against the manifest
+  entry, the block size and their digest, survive restarts, and the volume is
+  published in a single transaction only when every block is present. A commit
+  made while blocks are missing returns the refreshed missing list and keeps
+  all received data; repeating a finished commit returns the original volume
+  id. Reclamation (volume deletion, base retirement) runs normally while a
+  recovery is open: only explicitly uploaded blocks are pinned, store-matched
+  blocks stay dynamically resolved and simply reappear as missing if reclaimed.
 * All state is committed in SQLite WAL transactions with `synchronous=FULL`, so
   after a crash or `SIGKILL` a volume remains readable and writable, and a base
   is either fully usable or fully retired (never half-removed).
@@ -58,7 +70,12 @@ The script performs the whole workflow and asserts each step:
 6. `commit` retirement, then read back: late write, earlier write, zeroed block
    and untouched inherited block all survive; direct base read → `410`,
 7. delete the volumes, observe reclaimed slots and a later write reusing them,
-8. run `/verify`.
+8. open a recovery from a remote-backup SHA-256 manifest: the missing-digest
+   list collapses duplicates, an incomplete commit returns the refreshed list,
+   reclamation runs in parallel, the final block upload recycles a freed slot,
+   the volume is published once (a repeat commit returns the same volume id)
+   and every restored block is read back,
+9. run `/verify`.
 
 ## API summary
 
@@ -82,7 +99,14 @@ The script performs the whole workflow and asserts each step:
 | PUT | `/volumes/{id}/blocks/{i}/raw` | Write a block (raw octet-stream) |
 | POST | `/volumes/{id}/blocks/{i}/zero` | Zero a block |
 | DELETE | `/volumes/{id}` | Delete a volume and release its blocks |
-| GET | `/stats` | Storage, reference and reclamation stats |
+| POST | `/recoveries` | Open a recovery (volume name, block size, ordered SHA-256 manifest) |
+| GET | `/recoveries` | List recovery sessions and their progress |
+| GET | `/recoveries/{id}` | Recovery details incl. distinct missing digests |
+| PUT | `/recoveries/{id}/blocks/{i}` | Upload one missing block (JSON base64 + sha256) |
+| PUT | `/recoveries/{id}/blocks/{i}/raw` | Upload one missing block (raw octet-stream + sha256 query) |
+| POST | `/recoveries/{id}/commit` | Publish the volume atomically; 409 + missing list if incomplete |
+| DELETE | `/recoveries/{id}` | Abandon a recovery and release its uploaded blocks |
+| GET | `/stats` | Storage, reference, recovery and reclamation stats |
 | GET | `/verify` | Full consistency audit (`ok` plus issue list) |
 | GET | `/reclaim-events` | Reclamation audit trail (including slot reuse) |
 | GET | `/healthz` | Liveness probe |
@@ -98,7 +122,14 @@ block, 65 536 blocks and 256 MiB per base).
   writes (`reuse_count`, `reclaim_events.reused_at`).
 * `bases` / `base_blocks` — the read-only catalogue and its block → payload map.
 * `volumes` / `volume_blocks` — each volume block maps to a payload with an
-  `origin` of `base`, `written` or `zeroed`.
+  `origin` of `base`, `written`, `zeroed` or `restored` (the last marks blocks
+  of a volume published by a recovery; such volumes have no base).
+* `recoveries` / `recovery_blocks` — in-flight remote-backup restores. The
+  full manifest is stored up front; `payload_id` is set only for blocks the
+  client explicitly uploaded, and those references pin the payload against
+  reclamation. Store-matched blocks carry no reference and are resolved by
+  content address at commit time. On publish every block is resolved inside
+  one transaction and the recovery rows are released.
 * `reclaim_events` — audit trail for every released payload slot.
 
 Every mutation is a `BEGIN IMMEDIATE` transaction, so concurrent writers queue
@@ -117,16 +148,20 @@ uvicorn app.main:app --reload        # BLOCKSTORE_DB defaults to ./blockstore.db
 ## Tests and checks
 
 ```bash
-pytest -q                            # 40 tests: blocks, dedup, retirement,
+pytest -q                            # 66 tests: blocks, dedup, retirement,
+                                     # recovery (+restart/migration),
                                      # concurrency, restart/crash recovery
 python scripts/check.py              # static review checks
 python scripts/crash_check.py        # SIGKILL during write bursts and commits
 python scripts/demo.py --url ...     # end-to-end demo against a live service
 ```
 
-`tests/test_restart.py` and `scripts/crash_check.py` start a real uvicorn
-process, `SIGKILL` it and restart on the same SQLite file. They require a free
-local port and the current Python environment (uvicorn installed).
+`tests/test_restart.py`, `tests/test_recovery_restart.py` and
+`scripts/crash_check.py` start a real uvicorn process, `SIGKILL` it and
+restart on the same SQLite file. They require a free local port and the
+current Python environment (uvicorn installed). `tests/test_migration.py`
+builds a genuine schema-v1 database and verifies the in-place upgrade to v2
+(recovery support) preserves every existing block.
 
 ## Operational notes
 

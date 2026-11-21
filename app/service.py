@@ -8,7 +8,8 @@ Key invariants
 --------------
 1. A ``payloads`` row is the single stored copy of a block's bytes.
    ``refcount`` equals the number of ``base_blocks`` rows plus the number of
-   ``volume_blocks`` rows pointing at it.
+   ``volume_blocks`` rows plus the number of linked ``recovery_blocks`` rows
+   pointing at it.
 2. Every volume block always points at a payload.  Volumes therefore never
    need the base to serve a read, which is what makes base removal safe.
 3. References are only dropped inside the same transaction that removes the
@@ -16,6 +17,11 @@ Key invariants
 4. Unreferenced payloads are deleted immediately and a ``reclaim_events`` row
    records the released bytes.  SQLite puts their pages on the freelist, where
    the next writes reuse them.
+5. A recovery pins only the blocks the client explicitly uploads.  Blocks
+   merely matched against content already in the store hold no reference, so
+   ordinary reclamation can remove them; the missing list and the commit are
+   recomputed from live payloads, and the volume is published atomically only
+   when the whole manifest resolves inside one write transaction.
 """
 
 from __future__ import annotations
@@ -32,19 +38,34 @@ from typing import Sequence
 from .db import Database
 
 MAX_BLOCK_SIZE = 1024 * 1024          # 1 MiB per block
-MAX_BLOCK_COUNT = 65536               # 65 536 blocks per base
+MAX_BLOCK_COUNT = 65536               # 65 536 blocks per base or recovery
 MAX_BASE_BYTES = 256 * 1024 * 1024    # 256 MiB per base image
+SHA256_HEX_LENGTH = 64                # SHA-256 digest rendered as lowercase hex
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Restored volumes have no base; the provenance column is kept NOT NULL with
+# this sentinel rather than relaxing the schema.
+RESTORED_BASE_NAME = ""
+RESTORED_ORIGIN = "restored"
 
 
 class ServiceError(Exception):
     """Domain error carrying the HTTP status the API should return."""
 
-    def __init__(self, status_code: int, detail: str, code: str = "error") -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        code: str = "error",
+        extra: dict | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
         self.code = code
+        # Optional extra keys merged into the HTTP error body (e.g. the latest
+        # missing-block list returned by an unsuccessful recovery commit).
+        self.extra = extra or {}
 
 
 def utcnow() -> str:
@@ -74,6 +95,25 @@ def validate_geometry(block_size: int, block_count: int) -> None:
         raise ServiceError(
             422, f"base image exceeds {MAX_BASE_BYTES} bytes", "base_too_large"
         )
+
+
+def validate_manifest(block_size: int, block_count: int, manifest: Sequence[str]) -> None:
+    """Validate a recovery request's geometry and ordered SHA-256 manifest."""
+    validate_geometry(block_size, block_count)
+    if not isinstance(manifest, Sequence) or len(manifest) != block_count:
+        raise ServiceError(
+            422,
+            f"manifest must list exactly {block_count} SHA-256 digests, got "
+            f"{len(manifest) if isinstance(manifest, Sequence) else 0}",
+            "manifest_length_mismatch",
+        )
+    for index, digest in enumerate(manifest):
+        if not isinstance(digest, str) or not _SHA256_RE.match(digest):
+            raise ServiceError(
+                422,
+                f"manifest[{index}] is not a 64-character lowercase hex SHA-256 digest",
+                "invalid_manifest_digest",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +557,15 @@ class BlockStoreService:
                         f"base is '{base['status']}'; new volumes require an active base",
                         "base_not_active",
                     )
+                if conn.execute(
+                    "SELECT 1 FROM recoveries WHERE volume_name = ? AND status = 'recovering'",
+                    (name,),
+                ).fetchone():
+                    raise ServiceError(
+                        409,
+                        f"volume name '{name}' is reserved by an in-progress recovery",
+                        "name_conflict",
+                    )
                 blocks = conn.execute(
                     "SELECT block_index, payload_id FROM base_blocks "
                     "WHERE base_id = ? ORDER BY block_index",
@@ -659,7 +708,7 @@ class BlockStoreService:
         return {
             "volume_id": volume_id,
             "name": volume["name"],
-            "base_name": volume["base_name"],
+            "base_name": volume["base_name"] or None,
             "block_size": int(volume["block_size"]),
             "block_count": int(volume["block_count"]),
             "blocks": blocks,
@@ -778,6 +827,471 @@ class BlockStoreService:
                 "bytes_reclaimed": freed_bytes,
             }
 
+    # -------------------------------------------------------------- recovery
+    def create_recovery(
+        self, name: str, volume_name: str, block_size: int, manifest: Sequence[str]
+    ) -> dict:
+        """Open a remote-backup recovery session for a not-yet-existing volume.
+
+        The manifest is the ordered SHA-256 digest per block index.  A block is
+        considered *present* without any transfer when the content-addressed
+        store already holds its bytes (same size and digest).  Only blocks the
+        client explicitly uploads pin a payload reference; store-matched blocks
+        stay dynamically resolved so ordinary reclamation (volume deletion,
+        base retirement) can reclaim them and turn them missing again.
+        """
+        validate_name(name, "recovery name")
+        validate_name(volume_name, "volume name")
+        validate_manifest(block_size, len(manifest), list(manifest))
+
+        now = utcnow()
+        recovery_id = str(uuid.uuid4())
+        try:
+            with self.db.write() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM recoveries WHERE name = ?", (name,)
+                ).fetchone():
+                    raise ServiceError(
+                        409, f"recovery name '{name}' already exists", "name_conflict"
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM volumes WHERE name = ?", (volume_name,)
+                ).fetchone() or conn.execute(
+                    "SELECT 1 FROM recoveries WHERE volume_name = ?", (volume_name,)
+                ).fetchone():
+                    raise ServiceError(
+                        409,
+                        f"volume name '{volume_name}' is already in use or reserved",
+                        "name_conflict",
+                    )
+                conn.execute(
+                    "INSERT INTO recoveries(id, name, volume_name, block_size, "
+                    "block_count, status, created_at) VALUES (?, ?, ?, ?, ?, "
+                    "'recovering', ?)",
+                    (
+                        recovery_id,
+                        name,
+                        volume_name,
+                        block_size,
+                        len(manifest),
+                        now,
+                    ),
+                )
+                # Every manifest entry starts unlinked; presence of store-held
+                # blocks is derived dynamically, never pinned at creation time.
+                conn.executemany(
+                    "INSERT INTO recovery_blocks(recovery_id, block_index, "
+                    "expected_hash, payload_id) VALUES (?, ?, ?, NULL)",
+                    [
+                        (recovery_id, index, digest)
+                        for index, digest in enumerate(manifest)
+                    ],
+                )
+        except sqlite3.IntegrityError as exc:
+            if "recoveries.name" in str(exc) or "recoveries.volume_name" in str(exc):
+                raise ServiceError(
+                    409, "recovery or volume name already exists", "name_conflict"
+                )
+            raise
+        return self.get_recovery(recovery_id)
+
+    def upload_recovery_block(
+        self,
+        recovery_id: str,
+        block_index: int,
+        expected_hash: str,
+        data: bytes,
+    ) -> dict:
+        """Supply one missing block of a recovery.
+
+        The manifest entry, the block size and the digest claimed by the client
+        are all checked before anything is stored.  When the bytes already live
+        in the store the block resolves through content addressing without a
+        new reference; otherwise the uploaded payload is acquired and pinned by
+        the recovery so it survives reclamation and restart.  Re-uploading an
+        already linked block is a harmless no-op.
+        """
+        if not _SHA256_RE.match(expected_hash or ""):
+            raise ServiceError(
+                422,
+                "sha256 must be a 64-character lowercase hex SHA-256 digest",
+                "invalid_manifest_digest",
+            )
+        now = utcnow()
+        with self.db.write() as conn:
+            recovery = self._get_recovery_row(conn, recovery_id)
+            if recovery["status"] != "recovering":
+                raise ServiceError(
+                    409,
+                    "recovery is already published; no more blocks are accepted",
+                    "recovery_published",
+                )
+            block_size = int(recovery["block_size"])
+            row = conn.execute(
+                "SELECT expected_hash, payload_id FROM recovery_blocks "
+                "WHERE recovery_id = ? AND block_index = ?",
+                (recovery_id, block_index),
+            ).fetchone()
+            if row is None:
+                raise ServiceError(
+                    404,
+                    f"block index {block_index} is not part of this recovery's "
+                    f"manifest (0..{int(recovery['block_count']) - 1})",
+                    "block_out_of_range",
+                )
+            if row["expected_hash"] != expected_hash:
+                raise ServiceError(
+                    422,
+                    "supplied sha256 does not match this block's manifest entry",
+                    "manifest_digest_mismatch",
+                )
+            if len(data) != block_size:
+                raise ServiceError(
+                    422,
+                    f"block must be exactly {block_size} bytes, got {len(data)}",
+                    "invalid_block_length",
+                )
+            actual_hash = hashlib.sha256(data).hexdigest()
+            if actual_hash != expected_hash:
+                raise ServiceError(
+                    422,
+                    "block bytes hash to a different digest than the manifest entry",
+                    "block_hash_mismatch",
+                )
+
+            already_uploaded = row["payload_id"] is not None
+            # Was this block already resolvable before this request stored it?
+            was_present = already_uploaded or self._store_has_payload(
+                conn, block_size, expected_hash
+            )
+            if not already_uploaded:
+                # Acquire (or recycle) a content-addressed payload and pin it for
+                # the recovery.  When the same bytes are already live in the
+                # store, _acquire_payload returns that row and the extra ref is
+                # what keeps it from being reclaimed before publish.
+                payload_id = _acquire_payload(conn, block_size, data, now)
+                _add_ref(conn, payload_id, 1, now, "recovery_upload")
+                conn.execute(
+                    "UPDATE recovery_blocks SET payload_id = ? "
+                    "WHERE recovery_id = ? AND block_index = ?",
+                    (payload_id, recovery_id, block_index),
+                )
+            return {
+                "recovery_id": recovery_id,
+                "block_index": block_index,
+                "block_size": block_size,
+                "sha256": expected_hash,
+                "already_present": was_present,
+                "acknowledged": True,
+                **self._recovery_progress(conn, recovery_id),
+            }
+
+    def commit_recovery(self, recovery_id: str) -> dict:
+        """Publish the writable volume once every manifest block is present.
+
+        Presence is re-evaluated inside one ``BEGIN IMMEDIATE`` transaction, so
+        a payload cannot be reclaimed between the check and the publish.  If
+        blocks are still missing (for example because a concurrent delete or
+        retirement reclaimed a store-matched block that was never uploaded), no
+        volume is created, already received data is retained, and the latest
+        missing-block list is returned with a 409.  Repeating a successful
+        commit returns the original volume id instead of creating a second one.
+        """
+        now = utcnow()
+        with self.db.write() as conn:
+            recovery = self._get_recovery_row(conn, recovery_id)
+            if recovery["status"] == "published":
+                volume_id = recovery["volume_id"]
+                if volume_id is None:
+                    raise ServiceError(
+                        410,
+                        "recovery was published but its volume has since been deleted",
+                        "recovery_volume_deleted",
+                    )
+                return {
+                    "recovery_id": recovery_id,
+                    "status": "published",
+                    "already_published": True,
+                    "volume_id": volume_id,
+                    "volume_name": recovery["volume_name"],
+                }
+
+            missing = self._missing_digests(conn, recovery_id)
+            if missing:
+                raise ServiceError(
+                    409,
+                    f"recovery is still missing {len(missing)} block(s); upload them "
+                    "and commit again",
+                    "recovery_incomplete",
+                    extra={
+                        "recovery_id": recovery_id,
+                        "status": "recovering",
+                        "missing_count": len(missing),
+                        "missing_digests": missing,
+                    },
+                )
+
+            block_size = int(recovery["block_size"])
+            block_count = int(recovery["block_count"])
+            # Resolve every manifest entry to a live payload inside the write
+            # lock.  Uploaded entries keep their row; store-matched entries are
+            # looked up by content address.
+            entries = conn.execute(
+                "SELECT block_index, expected_hash, payload_id FROM recovery_blocks "
+                "WHERE recovery_id = ? ORDER BY block_index",
+                (recovery_id,),
+            ).fetchall()
+            resolved: list[tuple[int, int]] = []
+            for entry in entries:
+                payload_id = entry["payload_id"]
+                if payload_id is None:
+                    match = conn.execute(
+                        "SELECT id FROM payloads WHERE block_size = ? AND "
+                        "content_hash = ? AND free = 0",
+                        (block_size, entry["expected_hash"]),
+                    ).fetchone()
+                    if match is None:  # vanished since the missing check
+                        raise ServiceError(
+                            409,
+                            "a required block was reclaimed before publish; upload "
+                            "it and commit again",
+                            "recovery_incomplete",
+                            extra={
+                                "recovery_id": recovery_id,
+                                "status": "recovering",
+                                "missing_count": 1,
+                                "missing_digests": [entry["expected_hash"]],
+                            },
+                        )
+                    payload_id = int(match["id"])
+                resolved.append((int(entry["block_index"]), int(payload_id)))
+
+            volume_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO volumes(id, name, base_id, base_name, block_size, "
+                "block_count, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                (
+                    volume_id,
+                    recovery["volume_name"],
+                    RESTORED_BASE_NAME,
+                    block_size,
+                    block_count,
+                    now,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO volume_blocks(volume_id, block_index, payload_id, origin) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (volume_id, block_index, payload_id, RESTORED_ORIGIN)
+                    for block_index, payload_id in resolved
+                ],
+            )
+            # Every resolved payload gains one reference from the new volume.
+            volume_counts: Counter[int] = Counter(
+                payload_id for _, payload_id in resolved
+            )
+            for payload_id, count in volume_counts.items():
+                _add_ref(conn, payload_id, count, now, "recovery_publish")
+            # Uploaded entries also carry a recovery reference; drop those now
+            # that the volume owns its own.  Store-matched entries had none.
+            upload_counts = Counter(
+                int(row["payload_id"])
+                for row in entries
+                if row["payload_id"] is not None
+            )
+            conn.execute(
+                "DELETE FROM recovery_blocks WHERE recovery_id = ?", (recovery_id,)
+            )
+            for payload_id, count in upload_counts.items():
+                _add_ref(conn, payload_id, -count, now, "recovery_publish")
+            conn.execute(
+                "UPDATE recoveries SET status = 'published', published_at = ?, "
+                "volume_id = ? WHERE id = ?",
+                (now, volume_id, recovery_id),
+            )
+        detail = self.get_volume(volume_id)
+        detail.update(
+            {
+                "recovery_id": recovery_id,
+                "status": "published",
+                "already_published": False,
+            }
+        )
+        return detail
+
+    def delete_recovery(self, recovery_id: str) -> dict:
+        """Abandon a recovery session and release the blocks it was holding."""
+        now = utcnow()
+        with self.db.write() as conn:
+            recovery = self._get_recovery_row(conn, recovery_id)
+            if recovery["status"] == "published":
+                raise ServiceError(
+                    409,
+                    "a published recovery cannot be deleted; delete the volume instead",
+                    "recovery_published",
+                )
+            rows = conn.execute(
+                "SELECT payload_id, COUNT(*) AS n FROM recovery_blocks "
+                "WHERE recovery_id = ? AND payload_id IS NOT NULL GROUP BY payload_id",
+                (recovery_id,),
+            ).fetchall()
+            counts = Counter({int(r["payload_id"]): int(r["n"]) for r in rows})
+            conn.execute("DELETE FROM recoveries WHERE id = ?", (recovery_id,))
+            freed_rows, freed_bytes = _release_payloads(
+                conn, counts, now, "recovery_abandon"
+            )
+            return {
+                "recovery_id": recovery_id,
+                "name": recovery["name"],
+                "deleted": True,
+                "payloads_reclaimed": freed_rows,
+                "bytes_reclaimed": freed_bytes,
+            }
+
+    def list_recoveries(self) -> list[dict]:
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM recoveries ORDER BY created_at"
+            ).fetchall()
+            return [self._recovery_summary(conn, row) for row in rows]
+
+    def get_recovery(self, recovery_id: str) -> dict:
+        with self.db.read() as conn:
+            recovery = self._get_recovery_row(conn, recovery_id)
+            return self._recovery_summary(conn, recovery)
+
+    def _get_recovery_row(
+        self, conn: sqlite3.Connection, recovery_id: str
+    ) -> sqlite3.Row:
+        recovery = conn.execute(
+            "SELECT * FROM recoveries WHERE id = ?", (recovery_id,)
+        ).fetchone()
+        if recovery is None:
+            raise ServiceError(
+                404, f"recovery '{recovery_id}' not found", "recovery_not_found"
+            )
+        return recovery
+
+    @staticmethod
+    def _store_has_payload(
+        conn: sqlite3.Connection, block_size: int, digest: str
+    ) -> bool:
+        """Whether a live payload with this size and content hash is stored."""
+        return conn.execute(
+            "SELECT 1 FROM payloads WHERE block_size = ? AND content_hash = ? "
+            "AND free = 0",
+            (block_size, digest),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _missing_digests(conn: sqlite3.Connection, recovery_id: str) -> list[str]:
+        """Distinct digests of blocks that are neither uploaded nor store-held.
+
+        Each digest is listed once, ordered by the first block index where it
+        occurs.  A block counts as present when the recovery uploaded it
+        (``payload_id`` set) or when a live payload with the matching size and
+        hash currently exists in the content-addressed store.
+        """
+        rows = conn.execute(
+            """
+            SELECT rb.expected_hash, MIN(rb.block_index) AS first_index
+            FROM recovery_blocks rb
+            JOIN recoveries r ON r.id = rb.recovery_id
+            WHERE rb.recovery_id = ?
+              AND rb.payload_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM payloads p
+                  WHERE p.block_size = r.block_size
+                    AND p.content_hash = rb.expected_hash
+                    AND p.free = 0
+              )
+            GROUP BY rb.expected_hash
+            ORDER BY first_index
+            """,
+            (recovery_id,),
+        ).fetchall()
+        return [row["expected_hash"] for row in rows]
+
+    def _recovery_progress(
+        self, conn: sqlite3.Connection, recovery_id: str
+    ) -> dict:
+        recovery = conn.execute(
+            "SELECT block_count, status FROM recoveries WHERE id = ?",
+            (recovery_id,),
+        ).fetchone()
+        total = int(recovery["block_count"])
+        if recovery["status"] == "published":
+            # Manifest rows are released at publish: the published volume now
+            # owns every block, so the session reports nothing missing.
+            distinct_row = conn.execute(
+                "SELECT COUNT(DISTINCT p.content_hash) AS n "
+                "FROM volume_blocks vb JOIN payloads p ON p.id = vb.payload_id "
+                "JOIN recoveries rec ON rec.volume_id = vb.volume_id "
+                "WHERE rec.id = ?",
+                (recovery_id,),
+            ).fetchone()
+            distinct = int(distinct_row["n"]) if distinct_row is not None else total
+            return {
+                "block_count": total,
+                "blocks_present": total,
+                "blocks_missing": 0,
+                "blocks_uploaded": 0,
+                "distinct_digests": distinct,
+                "missing_count": 0,
+                "missing_digests": [],
+            }
+        # A block is present when uploaded (pinned) or currently resolvable
+        # against a live payload in the store.
+        totals = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(
+                       rb.payload_id IS NOT NULL
+                       OR EXISTS (
+                           SELECT 1 FROM payloads p
+                           WHERE p.block_size = r.block_size
+                             AND p.content_hash = rb.expected_hash
+                             AND p.free = 0
+                       )
+                   ), 0) AS present,
+                   COUNT(DISTINCT rb.expected_hash) AS distinct_total,
+                   COALESCE(SUM(rb.payload_id IS NOT NULL), 0) AS uploaded
+            FROM recovery_blocks rb
+            JOIN recoveries r ON r.id = rb.recovery_id
+            WHERE rb.recovery_id = ?
+            """,
+            (recovery_id,),
+        ).fetchone()
+        present = int(totals["present"])
+        missing_digests = self._missing_digests(conn, recovery_id)
+        return {
+            "block_count": total,
+            "blocks_present": present,
+            "blocks_missing": total - present,
+            "blocks_uploaded": int(totals["uploaded"]),
+            "distinct_digests": int(totals["distinct_total"]),
+            "missing_count": len(missing_digests),
+            "missing_digests": missing_digests,
+        }
+
+    def _recovery_summary(
+        self, conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict:
+        summary = {
+            "id": row["id"],
+            "name": row["name"],
+            "volume_name": row["volume_name"],
+            "block_size": int(row["block_size"]),
+            "block_count": int(row["block_count"]),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "published_at": row["published_at"],
+            "volume_id": row["volume_id"],
+        }
+        summary.update(self._recovery_progress(conn, row["id"]))
+        return summary
+
     def _volume_summary(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         distinct = int(
             conn.execute(
@@ -788,8 +1302,9 @@ class BlockStoreService:
         return {
             "id": row["id"],
             "name": row["name"],
+            "source": "recovery" if row["base_name"] == RESTORED_BASE_NAME else "base",
             "base_id": row["base_id"],
-            "base_name": row["base_name"],
+            "base_name": row["base_name"] or None,
             "block_size": int(row["block_size"]),
             "block_count": int(row["block_count"]),
             "created_at": row["created_at"],
@@ -839,6 +1354,21 @@ class BlockStoreService:
                 "COALESCE(SUM(reused_at IS NOT NULL), 0) AS reused "
                 "FROM reclaim_events"
             ).fetchone()
+            recovery_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM recoveries GROUP BY status"
+            ).fetchall()
+            recovery_counts = {r["status"]: int(r["n"]) for r in recovery_rows}
+            recovery_refs = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM recovery_blocks WHERE payload_id IS NOT NULL"
+                ).fetchone()[0]
+            )
+            distinct_recovery_digests = int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT expected_hash) FROM recovery_blocks "
+                    "WHERE payload_id IS NOT NULL"
+                ).fetchone()[0]
+            )
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
             freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
@@ -860,6 +1390,13 @@ class BlockStoreService:
                 "events": int(reclaim["n"]),
                 "bytes_released": int(reclaim["bytes"]),
                 "slots_reused": int(reclaim["reused"]),
+            },
+            "recoveries": {
+                "total": sum(recovery_counts.values()),
+                "recovering": recovery_counts.get("recovering", 0),
+                "published": recovery_counts.get("published", 0),
+                "block_references_held": recovery_refs,
+                "distinct_digests_held": distinct_recovery_digests,
             },
             "database": {
                 "page_size": page_size,
@@ -888,6 +1425,7 @@ class BlockStoreService:
                 SELECT p.id, p.refcount, p.free,
                        (SELECT COUNT(*) FROM base_blocks b WHERE b.payload_id = p.id)
                      + (SELECT COUNT(*) FROM volume_blocks v WHERE v.payload_id = p.id)
+                     + (SELECT COUNT(*) FROM recovery_blocks r WHERE r.payload_id = p.id)
                        AS actual
                 FROM payloads p
                 """
@@ -924,6 +1462,15 @@ class BlockStoreService:
             if int(dangling_base):
                 issues.append(
                     {"check": "dangling_base_blocks", "count": int(dangling_base)}
+                )
+            dangling_recovery = conn.execute(
+                "SELECT COUNT(*) FROM recovery_blocks rb "
+                "LEFT JOIN payloads p ON p.id = rb.payload_id "
+                "WHERE rb.payload_id IS NOT NULL AND p.id IS NULL"
+            ).fetchone()[0]
+            if int(dangling_recovery):
+                issues.append(
+                    {"check": "dangling_recovery_blocks", "count": int(dangling_recovery)}
                 )
             # 3. volumes must be complete.
             incomplete = conn.execute(
@@ -974,6 +1521,71 @@ class BlockStoreService:
             ).fetchone()[0]
             if int(bad_free):
                 issues.append({"check": "free_slots_zeroed", "count": int(bad_free)})
+            # 6. recovery sessions: complete manifest, linked payloads live,
+            #    published sessions keep no block rows and point at a volume.
+            recoveries = conn.execute("SELECT * FROM recoveries").fetchall()
+            for recovery in recoveries:
+                actual = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM recovery_blocks WHERE recovery_id = ?",
+                        (recovery["id"],),
+                    ).fetchone()[0]
+                )
+                if recovery["status"] == "recovering" and actual != int(
+                    recovery["block_count"]
+                ):
+                    issues.append(
+                        {
+                            "check": "recovery_manifest_complete",
+                            "recovery": recovery["name"],
+                            "expected": int(recovery["block_count"]),
+                            "actual": actual,
+                        }
+                    )
+                if recovery["status"] == "published" and actual != 0:
+                    issues.append(
+                        {
+                            "check": "published_recovery_empty",
+                            "recovery": recovery["name"],
+                            "stored_blocks": actual,
+                        }
+                    )
+                bad_hash = conn.execute(
+                    "SELECT COUNT(*) FROM recovery_blocks rb "
+                    "JOIN payloads p ON p.id = rb.payload_id "
+                    "WHERE rb.recovery_id = ? AND p.content_hash <> rb.expected_hash",
+                    (recovery["id"],),
+                ).fetchone()[0]
+                if int(bad_hash):
+                    issues.append(
+                        {
+                            "check": "recovery_payload_hash",
+                            "recovery": recovery["name"],
+                            "count": int(bad_hash),
+                        }
+                    )
+                if recovery["status"] == "published":
+                    volume = conn.execute(
+                        "SELECT block_count FROM volumes WHERE id = ?",
+                        (recovery["volume_id"],),
+                    ).fetchone()
+                    if recovery["volume_id"] is None or volume is None:
+                        # volume_id may legitimately be NULL only when the
+                        # published volume was deleted afterwards.
+                        if recovery["volume_id"] is not None:
+                            issues.append(
+                                {
+                                    "check": "published_recovery_volume",
+                                    "recovery": recovery["name"],
+                                }
+                            )
+                    elif int(volume["block_count"]) != int(recovery["block_count"]):
+                        issues.append(
+                            {
+                                "check": "published_recovery_volume_size",
+                                "recovery": recovery["name"],
+                            }
+                        )
             counts = {
                 "payloads": int(
                     conn.execute(
@@ -995,5 +1607,13 @@ class BlockStoreService:
                     conn.execute("SELECT COUNT(*) FROM volume_blocks").fetchone()[0]
                 ),
                 "bases": int(conn.execute("SELECT COUNT(*) FROM bases").fetchone()[0]),
+                "recoveries": int(
+                    conn.execute("SELECT COUNT(*) FROM recoveries").fetchone()[0]
+                ),
+                "recovery_blocks": int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM recovery_blocks"
+                    ).fetchone()[0]
+                ),
             }
         return {"ok": not issues, "counts": counts, "issues": issues}

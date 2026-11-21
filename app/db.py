@@ -30,6 +30,13 @@ Bases move ``active -> retiring -> retired``.  Retirement is split into
 the base's references and marks the base retired in one atomic transaction.  A
 crash during commit leaves either the old state or the new state, never a
 half-retired base.
+
+Remote-backup recovery (schema v2) adds ``recoveries`` / ``recovery_blocks``.
+A recovery session stores the full block manifest up front; each block links a
+payload only once the bytes are available (already stored or uploaded).  The
+links are ordinary payload references, so deletion and retirement reclaim
+blocks normally while a recovery is in flight, and the volume is published in
+a single transaction only when every manifest block is linked.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -112,9 +119,47 @@ CREATE TABLE IF NOT EXISTS volume_blocks (
     volume_id   TEXT NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
     block_index INTEGER NOT NULL CHECK (block_index >= 0),
     payload_id  INTEGER NOT NULL REFERENCES payloads(id),
-    origin      TEXT NOT NULL CHECK (origin IN ('base', 'written', 'zeroed')),
+    origin      TEXT NOT NULL CHECK (origin IN ('base', 'written', 'zeroed', 'restored')),
     PRIMARY KEY (volume_id, block_index)
 );
+
+-- Remote-backup recovery sessions.  A recovery is an *incomplete* writable
+-- volume: the manifest (ordered SHA-256 per block index) is stored up front,
+-- while ``recovery_blocks.payload_id`` stays NULL until the matching block is
+-- supplied or found already present in the content-addressed store.  Each
+-- linked payload holds a normal reference, so volume deletion and base
+-- retirement keep reclaiming everything a recovery does not need and can never
+-- free a block a recovery still needs.  Only when every block is linked does
+-- ``commit_recovery`` publish the volume atomically.
+CREATE TABLE IF NOT EXISTS recoveries (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    -- Copied onto the volume when the recovery is published.
+    volume_name         TEXT NOT NULL UNIQUE,
+    block_size          INTEGER NOT NULL CHECK (block_size > 0),
+    block_count         INTEGER NOT NULL CHECK (block_count > 0),
+    status              TEXT NOT NULL CHECK (status IN ('recovering', 'published')),
+    created_at          TEXT NOT NULL,
+    published_at        TEXT,
+    -- Set to the new volume id on publish; cleared again if that volume is
+    -- later deleted (ON DELETE SET NULL), the session row remaining as audit.
+    volume_id           TEXT REFERENCES volumes(id) ON DELETE SET NULL,
+    CHECK ((status = 'published') = (published_at IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS recovery_blocks (
+    recovery_id TEXT NOT NULL REFERENCES recoveries(id) ON DELETE CASCADE,
+    block_index INTEGER NOT NULL CHECK (block_index >= 0),
+    -- Manifest entry: expected SHA-256 of this block, hex-encoded.
+    expected_hash TEXT NOT NULL,
+    -- NULL while the block is still missing; points at the stored payload once
+    -- supplied or matched against content already held by the store.
+    payload_id  INTEGER REFERENCES payloads(id),
+    PRIMARY KEY (recovery_id, block_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_blocks_payload ON recovery_blocks(payload_id);
+CREATE INDEX IF NOT EXISTS idx_recoveries_status ON recoveries(status);
 
 -- Audit trail of payload slots that were released.  ``reused_at`` shows when
 -- the slot's bytes were later handed out again by a write.
@@ -218,6 +263,8 @@ class Database:
                         f"database schema version {existing['value']} is newer than "
                         f"this service supports ({SCHEMA_VERSION}); refusing to open"
                     )
+                if existing is not None and int(existing["value"]) < SCHEMA_VERSION:
+                    self._migrate(conn, int(existing["value"]))
                 conn.executescript(_SCHEMA)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -247,6 +294,41 @@ class Database:
             ).fetchone()
             is not None
         )
+
+    def _migrate(self, conn: sqlite3.Connection, from_version: int) -> None:
+        """Upgrade an older database in place (single-process deployment).
+
+        Version 2 adds remote-backup recovery.  The only change to existing
+        tables is the extra ``restored`` value in the ``volume_blocks.origin``
+        check constraint; recreating that table preserves every row and its
+        references.  The migration runs before the v2 schema is applied, so the
+        recovery tables themselves are created by the regular DDL afterwards.
+        """
+        if from_version == 1:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executescript(
+                    """
+                    ALTER TABLE volume_blocks RENAME TO volume_blocks_v1;
+                    CREATE TABLE volume_blocks (
+                        volume_id   TEXT NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+                        block_index INTEGER NOT NULL CHECK (block_index >= 0),
+                        payload_id  INTEGER NOT NULL REFERENCES payloads(id),
+                        origin      TEXT NOT NULL
+                                    CHECK (origin IN ('base', 'written', 'zeroed', 'restored')),
+                        PRIMARY KEY (volume_id, block_index)
+                    );
+                    INSERT INTO volume_blocks(volume_id, block_index, payload_id, origin)
+                    SELECT volume_id, block_index, payload_id, origin FROM volume_blocks_v1;
+                    DROP TABLE volume_blocks_v1;
+                    CREATE INDEX IF NOT EXISTS idx_volume_blocks_payload
+                        ON volume_blocks(payload_id);
+                    """
+                )
+                conn.commit()
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def schema_version(self) -> int | None:
         with self.read() as conn:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import sys
 import urllib.error
@@ -29,6 +30,10 @@ def b64(data: bytes) -> str:
 
 def unb64(value: str) -> bytes:
     return base64.b64decode(value)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 class Api:
@@ -207,7 +212,92 @@ def main() -> int:
         f"reused={stats_after['reclaim']['slots_reused']})",
     )
 
-    print("\n8. Consistency audit")
+    print("\n8. Remote-backup recovery after reclamation, then read the new volume")
+    backup_blocks = [b"REMOTE01", b"REMOTE02", b"REMOTE01"]
+    manifest = [sha256(block) for block in backup_blocks]
+    status, recovery = api.post(
+        "/recoveries",
+        {
+            "name": f"{args.prefix}-recovery",
+            "volume_name": f"{args.prefix}-restored",
+            "block_size": 8,
+            "manifest": manifest,
+        },
+    )
+    check(status == 201, f"recovery opened ({recovery['block_count']} manifest blocks)")
+    check(
+        recovery["missing_count"] == 2,
+        f"distinct missing digests listed once each "
+        f"({recovery['missing_count']} of {len(set(manifest))})",
+    )
+    recovery_id = recovery["id"]
+
+    # Upload the first backup block; the duplicated third index needs no second
+    # transfer because it is content-addressed.
+    status, ack = api.put(
+        f"/recoveries/{recovery_id}/blocks/0",
+        {"sha256": manifest[0], "data_base64": b64(backup_blocks[0])},
+    )
+    check(status == 200 and ack["acknowledged"], "upload backup block 0")
+    status, detail = api.get(f"/recoveries/{recovery_id}")
+    check(
+        detail["blocks_present"] == 2 and detail["missing_count"] == 1,
+        f"duplicate block resolved without a transfer "
+        f"(present={detail['blocks_present']}, missing={detail['missing_count']})",
+    )
+
+    # Commit while a block is still missing: 409 with the refreshed list and
+    # all received data retained.
+    status, incomplete = api.post(f"/recoveries/{recovery_id}/commit")
+    check(status == 409, "incomplete commit is refused")
+    check(
+        incomplete["missing_digests"] == [manifest[1]],
+        f"latest missing-block list returned ({incomplete['missing_digests']})",
+    )
+
+    # Reclamation keeps working during the recovery.  Import and retire an
+    # unrelated base with a unique block so nothing else holds its payload.
+    status, extra_base = api.post(
+        "/bases",
+        {
+            "name": f"{args.prefix}-reclaim",
+            "block_size": 8,
+            "blocks_base64": [b64(b"FREEME00")],
+        },
+    )
+    check(status == 201, "import an unrelated base with a unique block")
+    status, extra_vol = api.post(
+        "/volumes", {"name": f"{args.prefix}-reclaim-vol", "base_id": extra_base["id"]}
+    )
+    check(status == 201, "create its volume")
+    api.post(f"/bases/{extra_base['id']}/retirement/prepare")
+    api.post(f"/bases/{extra_base['id']}/retirement/commit")
+    status, freed = api.delete(f"/volumes/{extra_vol['id']}")
+    check(status == 200 and freed["payloads_reclaimed"] == 1,
+          "unrelated block reclaimed while recovery is open")
+
+    # Supply the last missing block (it recycles the reclaimed slot) and publish.
+    status, ack = api.put(
+        f"/recoveries/{recovery_id}/blocks/1",
+        {"sha256": manifest[1], "data_base64": b64(backup_blocks[1])},
+    )
+    check(status == 200, "upload the final missing backup block")
+    status, published = api.post(f"/recoveries/{recovery_id}/commit")
+    check(status == 200 and published["status"] == "published", "volume published once")
+    restored_id = published["id"]
+    # Repeating the same recovery commit returns the original volume id.
+    status, again = api.post(f"/recoveries/{recovery_id}/commit")
+    check(
+        status == 200 and again.get("already_published") and again["volume_id"] == restored_id,
+        "repeated commit returns the original volume id",
+    )
+    for index, expected in enumerate(backup_blocks):
+        _, data = show_block(api, restored_id, index)
+        check(data == expected, f"restored volume block {index} -> {data!r}")
+    status, stats = api.get("/stats")
+    check(stats["recoveries"]["published"] >= 1, "published recovery counted in /stats")
+
+    print("\n9. Consistency audit")
     status, verify = api.get("/verify")
     check(status == 200 and verify["ok"], f"verify ok ({verify['counts']})")
 
